@@ -1,4 +1,5 @@
 import asyncio
+import html as html_lib
 import json
 import urllib.parse
 from pathlib import Path
@@ -30,6 +31,10 @@ except ImportError:
 
 def extract_51job_detail_summary_from_html(html: str) -> str:
     """从 51job 详情页提取职位描述正文。"""
+    structured_summary = extract_51job_detail_summary_from_nuxt_state(html)
+    if structured_summary:
+        return structured_summary
+
     soup = BeautifulSoup(html, "html.parser")
     selector_candidates = [
         "div.bmsg.job_msg.inbox",
@@ -43,7 +48,8 @@ def extract_51job_detail_summary_from_html(html: str) -> str:
     for selector in selector_candidates:
         candidates = []
         for node in soup.select(selector):
-            text = clean_multiline_text(node.get_text("\n", strip=True))
+            primary_node = node.find("div", recursive=False) or node
+            text = clean_multiline_text(primary_node.get_text("\n", strip=True))
             if looks_like_job_summary_text(text):
                 candidates.append(text)
         if candidates:
@@ -58,6 +64,176 @@ def extract_51job_detail_summary_from_html(html: str) -> str:
         if looks_like_job_summary_text(snippet):
             return snippet
     return ""
+
+
+def extract_51job_detail_summary_from_nuxt_state(html: str) -> str:
+    """Prefer structured detail text embedded in 51job's Nuxt state."""
+    summary = ""
+    patterns = [
+        r'jobDescribe:"((?:\\.|[^"])*)"',
+        r'"jobDescribe":"((?:\\.|[^"])*)"',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html, re.S)
+        if not match:
+            continue
+        try:
+            candidate = clean_multiline_text(json.loads(f'"{match.group(1)}"'))
+        except Exception:
+            candidate = clean_multiline_text(match.group(1).replace("\\u002F", "/"))
+        if looks_like_job_summary_text(candidate) or len(candidate) >= 80:
+            if len(candidate) > len(summary):
+                summary = candidate
+    return summary
+
+
+def extract_51job_detail_extras_from_html(html: str) -> dict[str, str]:
+    """Best-effort extraction for extra fields visible on 51job detail pages."""
+    soup = BeautifulSoup(html, "html.parser")
+    body_text = clean_multiline_text(soup.get_text("\n", strip=True))
+
+    def dedupe_texts(values: list[str]) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            cleaned = clean_text(value)
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            result.append(cleaned)
+        return result
+
+    def decode_js_fragment(value: str) -> str:
+        try:
+            return clean_text(json.loads(f'"{value}"'))
+        except Exception:
+            return clean_text(value.replace("\\u002F", "/"))
+
+    def extract_script_string(field_name: str) -> str:
+        match = re.search(rf'{re.escape(field_name)}:"((?:\\.|[^"])*)"', html)
+        if not match:
+            return ""
+        return decode_js_fragment(match.group(1))
+
+    lines = [clean_text(line) for line in body_text.split("\n") if clean_text(line)]
+
+    header_node = soup.select_one(".tHeader.tHjob")
+    header_lines = (
+        [clean_text(span.get_text(" ", strip=True)) for span in header_node.select("p.msg.ltype span")]
+        if header_node
+        else []
+    )
+    header_lines = [line for line in header_lines if line]
+
+    address = ""
+    address_node = soup.select_one(".job-address .bmsg .fp")
+    if address_node:
+        address = clean_text(address_node.get_text(" ", strip=True))
+    if not address:
+        address = extract_script_string("address")
+    if not address:
+        for marker in ["工作地址", "上班地址", "地址"]:
+            idx = body_text.find(marker)
+            if idx < 0:
+                continue
+            snippet = clean_multiline_text(body_text[idx : idx + 240])
+            snippet_lines = [line for line in snippet.split("\n") if clean_text(line)]
+            for candidate in snippet_lines[1:4]:
+                candidate_text = clean_text(candidate)
+                if candidate_text and candidate_text not in {"点击查看地图", "地图"}:
+                    address = candidate_text
+                    break
+            if address:
+                break
+
+    degree = ""
+    experience = ""
+    degree_tokens = ["初中", "高中", "中专", "大专", "本科", "硕士", "博士", "学历"]
+    experience_tokens = [
+        "应届",
+        "在校生",
+        "经验",
+        "实习生",
+        "1年",
+        "2年",
+        "3年",
+        "4年",
+        "5年",
+        "10年",
+        "无需经验",
+        "无经验",
+    ]
+    for line in header_lines + lines[:30]:
+        if not degree and any(token in line for token in degree_tokens):
+            degree = line
+        if not experience and any(token in line for token in experience_tokens):
+            experience = line
+        if degree and experience:
+            break
+    if not degree:
+        degree = extract_script_string("degreeString")
+    if not experience:
+        experience = extract_script_string("workYearString")
+
+    tag_nodes = soup.select(".job-detail .mt10 p.fp")
+    tags: list[str] = []
+    for node in tag_nodes:
+        label_node = node.select_one(".label")
+        label = clean_text(label_node.get_text(" ", strip=True)) if label_node else ""
+        if "关键" not in label:
+            continue
+        tags.extend(
+            clean_text(anchor.get_text(" ", strip=True))
+            for anchor in node.select("a")
+            if clean_text(anchor.get_text(" ", strip=True))
+        )
+    if not tags:
+        script_keywords = extract_script_string("jobKeywordString")
+        if script_keywords:
+            tags.extend(re.split(r"[,，/、\s]+", script_keywords))
+    if not tags:
+        for marker in ["关键词：", "关键词", "关键字：", "关键字"]:
+            idx = body_text.find(marker)
+            if idx < 0:
+                continue
+            snippet = clean_multiline_text(body_text[idx : idx + 200])
+            snippet_lines = [clean_text(line) for line in snippet.split("\n") if clean_text(line)]
+            if len(snippet_lines) >= 2:
+                tags.extend(re.split(r"[ /、,，]+", clean_text(" ".join(snippet_lines[1:3]))))
+                if tags:
+                    break
+    tags = dedupe_texts(tags)
+
+    benefits = [
+        clean_text(node.get_text(" ", strip=True))
+        for node in soup.select(".job-detail .tags .tag")
+        if clean_text(node.get_text(" ", strip=True))
+    ]
+    if not benefits:
+        script_welfare = extract_script_string("welfare")
+        if script_welfare:
+            benefits.extend(re.split(r"[,，/、]+", script_welfare))
+    if not benefits:
+        for line in lines:
+            if line.startswith("·") or line.startswith("-"):
+                clean_line = clean_text(line.lstrip("·- "))
+                if clean_line and len(clean_line) <= 40:
+                    benefits.append(clean_line)
+            if len(benefits) >= 6:
+                break
+    benefits = dedupe_texts(benefits)
+
+    remark_parts = []
+    if tags:
+        remark_parts.append("关键词：" + " / ".join(tags))
+
+    return {
+        "详细地址": address,
+        "学历要求": degree,
+        "经验要求": experience,
+        "福利标签": " / ".join(benefits),
+        "备注": " / ".join(remark_parts),
+    }
 
 
 def build_51job_detail_url(job_id: str) -> str:
@@ -86,6 +262,43 @@ def parse_51job_jobs_from_dom(html: str) -> list[dict[str, Any]]:
     """从 51job 搜索结果页 DOM 解析岗位列表。"""
     soup = BeautifulSoup(html, "html.parser")
     cards = soup.select("div.joblist-item")
+    use_new_layout = False
+    if not cards:
+        cards = soup.select("div.job-item")
+        use_new_layout = bool(cards)
+    if use_new_layout:
+        converted_cards: list[str] = []
+        for card in cards:
+            anchor_node = card.select_one("a[href]")
+            detail_url = normalize_absolute_url(
+                anchor_node.get("href", "") if anchor_node else "",
+                "https://jobs.51job.com",
+            )
+            job_name_node = card.select_one(".job-name")
+            salary_node = card.select_one(".salary")
+            company_node = card.select_one(".company")
+            location_node = card.select_one(".location")
+
+            job_name = clean_text(job_name_node.get_text(" ", strip=True)) if job_name_node else ""
+            salary = clean_text(salary_node.get_text(" ", strip=True)) if salary_node else ""
+            company_name = clean_text(company_node.get_text(" ", strip=True)) if company_node else ""
+            area = clean_text(location_node.get_text(" ", strip=True)) if location_node else ""
+            if not job_name and not company_name:
+                continue
+
+            converted_cards.append(
+                "<div class='joblist-item'>"
+                f"<div class='jname'>{html_lib.escape(job_name)}</div>"
+                f"<div class='sal'>{html_lib.escape(salary)}</div>"
+                f"<div class='area'>{html_lib.escape(area)}</div>"
+                f"<a class='comp' href='{html_lib.escape(detail_url, quote=True)}'>"
+                f"<span class='cname'>{html_lib.escape(company_name)}</span>"
+                "</a>"
+                "</div>"
+            )
+        if converted_cards:
+            return parse_51job_jobs_from_dom("<html><body>" + "".join(converted_cards) + "</body></html>")
+        return []
     jobs: list[dict[str, Any]] = []
 
     for card in cards:
@@ -197,7 +410,7 @@ async def search_51job_keyword(
         await page.goto(direct_url, wait_until="domcontentloaded", timeout=90000)
 
     await human_sleep(*settings["delays"]["after_open_search"])
-    if await page.locator(".joblist-item").count() > 0:
+    if await page.locator(".joblist-item, .job-item").count() > 0:
         return
 
     html = await page.content()
@@ -214,7 +427,7 @@ async def search_51job_keyword(
         try:
             await page.goto(direct_url, wait_until="domcontentloaded", timeout=90000)
             await human_sleep(*settings["delays"]["after_open_search"])
-            if await page.locator(".joblist-item").count() > 0:
+            if await page.locator(".joblist-item, .job-item").count() > 0:
                 return
         except Exception:
             pass
@@ -245,14 +458,21 @@ async def wait_for_manual_51job_auth(context, page, settings: dict[str, Any], re
         f"51job 需要人工处理：{reason}。请在打开的浏览器中使用手机号/短信验证码登录，"
         f"程序将在 {wait_seconds} 秒后继续。"
     )
-    await asyncio.sleep(wait_seconds)
+    while True:
+        try:
+            await asyncio.sleep(2)
+            current_html = await page.content()
+            if not looks_like_51job_verification_page(current_html):
+                break
+        except Exception:
+            await asyncio.sleep(1)
     print(f"51job 真实浏览器会话已保存在：{settings['user_data_dir']}")
 
     try:
-        await page.reload(wait_until="domcontentloaded", timeout=90000)
-        await human_sleep(*settings["delays"]["after_open_search"])
+        await page.wait_for_load_state("domcontentloaded", timeout=15000)
     except Exception:
         pass
+    await human_sleep(*settings["delays"]["after_open_search"])
 
 
 async def login_51job_profile(settings: dict[str, Any]) -> None:
@@ -328,10 +548,10 @@ async def fetch_51job_summary_from_detail_page(
     context,
     detail_url: str,
     settings: dict[str, Any],
-) -> str:
+) -> tuple[str, dict[str, str]]:
     """访问 51job 详情页，尽量提取工作内容/任职要求正文。"""
     if not detail_url:
-        return ""
+        return "", {}
 
     max_retries = settings["max_detail_retries"]
     for attempt in range(1, max_retries + 2):
@@ -356,22 +576,23 @@ async def fetch_51job_summary_from_detail_page(
                     html = await detail_page.content()
                 else:
                     emit_task_log(settings, f"51job 详情页触发验证，已跳过：{detail_url}")
-                    return ""
+                    return "", {}
 
             summary = extract_51job_detail_summary_from_html(html)
+            extras = extract_51job_detail_extras_from_html(html)
             if summary:
-                return summary
+                return summary, extras
 
             if attempt > max_retries:
-                return ""
+                return "", extras
             await human_sleep(*settings["delays"]["detail_retry"])
         except Exception as exc:
             if attempt > max_retries:
                 emit_task_log(settings, f"51job 详情页抓取失败，已放弃：{detail_url}，原因：{exc}")
-                return ""
+                return "", {}
             await human_sleep(*settings["delays"]["detail_retry"])
 
-    return ""
+    return "", {}
 
 
 async def enrich_51job_jobs_with_detail_summaries(
@@ -418,16 +639,33 @@ async def enrich_51job_jobs_with_detail_summaries(
                 crawled_link_store.save()
             update_task_progress(settings, current_detail_url=detail_url, detail_index=index, detail_total=total_jobs)
             emit_task_log(settings, f"51job 正在分析详情链接 ({index}/{total_jobs})：{detail_url}")
-            summary = await fetch_51job_summary_from_detail_page(
+            summary, extras = await fetch_51job_summary_from_detail_page(
                 detail_page=detail_page,
                 context=context,
                 detail_url=detail_url,
                 settings=settings,
             )
             if not summary:
+                if callable(item_callback):
+                    item_callback(item, index)
+                if is_cancel_requested(settings):
+                    emit_cancel_log_once(settings, "鏀跺埌涓璇锋眰锛屽綋鍓嶈鎯呭凡澶勭悊瀹屾垚锛屽仠姝㈢户缁垎鏋愬墿浣欒鎯呫€?")
+                    break
                 continue
             work_content, requirement = split_job_summary(summary)
             changed = False
+            for field in ["详细地址", "学历要求", "经验要求", "福利标签"]:
+                extra_value = clean_text(extras.get(field, ""))
+                if extra_value and clean_text(str(item.get(field, ""))) != extra_value:
+                    item[field] = extra_value
+                    changed = True
+            extra_remark = clean_text(extras.get("备注", ""))
+            if extra_remark:
+                current_remark = clean_text(str(item.get("备注", "")))
+                merged_remark = merge_distinct_text(current_remark, extra_remark)
+                if merged_remark and merged_remark != current_remark:
+                    item["备注"] = merged_remark
+                    changed = True
             if work_content and item.get("工作内容") != work_content:
                 item["工作内容"] = work_content
                 changed = True
@@ -655,7 +893,7 @@ async def crawl_51job(
                             },
                         )
 
-                if profile_ready:
+                if profile_ready and not settings.get("skip_detail_fetch"):
                     detail_updated = await enrich_51job_jobs_with_detail_summaries(
                         context=context,
                         jobs=page_jobs,

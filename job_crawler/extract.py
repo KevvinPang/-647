@@ -310,16 +310,27 @@ def build_record(index, item, job_type_level_1="", job_type_level_2=""):
 
 
 def export_records(items, output_file, job_type_level_1="", job_type_level_2=""):
-    """导出记录到 Excel"""
-    output_path = Path(output_file)
+    """导出记录到 Excel（先写临时文件，再重命名，避免冲突）"""
+    output_path = Path(output_file).resolve()
+    tmp_path = output_path.with_suffix(".tmp.xlsx")
+
+    # 读取现有数据
     if output_path.exists():
-        wb = load_workbook(output_path)
-        ws = wb.active
-        start_index = ws.max_row
+        try:
+            wb = load_workbook(str(output_path))
+            ws = wb.active
+            start_index = ws.max_row
+        except Exception:
+            # 文件损坏，当作新文件处理
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "直播影视传媒"
+            ws.append(HEADERS)
+            start_index = 1
     else:
         wb = Workbook()
         ws = wb.active
-        ws.title = "提取结果"
+        ws.title = "直播影视传媒"
         ws.append(HEADERS)
         start_index = 1
 
@@ -327,7 +338,10 @@ def export_records(items, output_file, job_type_level_1="", job_type_level_2="")
         record = build_record(index, item, job_type_level_1, job_type_level_2)
         ws.append([record.get(clean_header(header), "") for header in HEADERS])
 
-    wb.save(output_path)
+    # 写入临时文件再重命名（避免读写冲突）
+    wb.save(str(tmp_path))
+    wb.close()
+    tmp_path.replace(output_path)
 
 
 def extract_to_xlsx(json_data, output_file, job_type_level_1="", job_type_level_2=""):
